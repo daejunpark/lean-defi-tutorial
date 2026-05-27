@@ -1,0 +1,18 @@
+name = "tutorial"
+defaultTargets = ["SimpleTokensAndVaults", "LendingMarket"]
+
+[[require]]
+name = "mathlib"
+scope = "leanprover-community"
+rev = "v4.29.0"
+
+[[lean_lib]]
+name = "SimpleTokensAndVaults"
+srcDir = "simple-tokens-and-vaults"
+roots = ["Token", "Vault", "VaultNaive", "LossBound"]
+
+[[lean_lib]]
+name = "LendingMarket"
+srcDir = "lending-market"
+roots = ["Market"]
+globs = ["Defs.+", "Proofs.+", "Util.+"]

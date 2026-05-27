@@ -108,47 +108,61 @@ self-deposit would be balance-neutral on the asset side while still
 minting vault tokens, breaking price preservation. Real ERC-4626
 contracts have the same restriction implicitly via `msg.sender`. -/
 
+/-- Deposit `assets` and receive vault tokens. Returns the new state
+together with the number of vault tokens minted (= `vaultTokenFor s
+assets`). -/
 noncomputable def deposit (s : State) (user : Addr) (assets : ℕ) :
-    Option State :=
+    Option (State × ℕ) :=
   if user = vault then none
   else
     match ERC20.transferFrom s.assetToken user vault assets with
     | none => none
     | some assetToken' =>
       some
-        { vaultToken := ERC20.mint s.vaultToken user (vaultTokenFor s assets),
-          assetToken := assetToken' }
+        ({ vaultToken := ERC20.mint s.vaultToken user (vaultTokenFor s assets),
+           assetToken := assetToken' },
+         vaultTokenFor s assets)
 
+/-- Mint `tokens` vault tokens and pay the required assets. Returns
+the new state together with the asset cost (= `mintCost s tokens`). -/
 noncomputable def mint (s : State) (user : Addr) (tokens : ℕ) :
-    Option State :=
+    Option (State × ℕ) :=
   if user = vault then none
   else
     match ERC20.transferFrom s.assetToken user vault (mintCost s tokens) with
     | none => none
     | some assetToken' =>
       some
-        { vaultToken := ERC20.mint s.vaultToken user tokens,
-          assetToken := assetToken' }
+        ({ vaultToken := ERC20.mint s.vaultToken user tokens,
+           assetToken := assetToken' },
+         mintCost s tokens)
 
+/-- Redeem `tokens` vault tokens for assets. Returns the new state
+together with the assets paid out (= `assetFor s tokens`). -/
 noncomputable def redeem (s : State) (user : Addr) (tokens : ℕ) :
-    Option State :=
+    Option (State × ℕ) :=
   match ERC20.burn s.vaultToken user tokens with
   | none => none
   | some vaultToken' =>
     match ERC20.transferFrom s.assetToken vault user (assetFor s tokens) with
     | none => none
     | some assetToken' =>
-      some { vaultToken := vaultToken', assetToken := assetToken' }
+      some ({ vaultToken := vaultToken', assetToken := assetToken' },
+            assetFor s tokens)
 
+/-- Withdraw `assets` by burning the required vault tokens. Returns
+the new state together with the vault tokens burnt
+(= `withdrawCost s assets`). -/
 noncomputable def withdraw (s : State) (user : Addr) (assets : ℕ) :
-    Option State :=
+    Option (State × ℕ) :=
   match ERC20.burn s.vaultToken user (withdrawCost s assets) with
   | none => none
   | some vaultToken' =>
     match ERC20.transferFrom s.assetToken vault user assets with
     | none => none
     | some assetToken' =>
-      some { vaultToken := vaultToken', assetToken := assetToken' }
+      some ({ vaultToken := vaultToken', assetToken := assetToken' },
+            withdrawCost s assets)
 
 /-- Asset tokens flow *into* the vault without minting vault tokens.
 Yield, donation, or accidental transfer all look the same to the
@@ -189,10 +203,10 @@ def Action.noLoss : Action → Prop
 
 noncomputable def step (a : Action) (s : State) : Option State :=
   match a with
-  | .deposit u amt   => deposit s u amt
-  | .mint u tk       => mint s u tk
-  | .withdraw u amt  => withdraw s u amt
-  | .redeem u tk     => redeem s u tk
+  | .deposit u amt   => (deposit s u amt).map Prod.fst
+  | .mint u tk       => (mint s u tk).map Prod.fst
+  | .withdraw u amt  => (withdraw s u amt).map Prod.fst
+  | .redeem u tk     => (redeem s u tk).map Prod.fst
   | .profit amt      => some (profit s amt)
   | .loss amt        => loss s amt
 
@@ -251,10 +265,11 @@ private lemma withdrawCost_bound (s : State) (d : ℕ) :
   unfold withdrawCost
   exact ceilDiv_mul_ge _ (by have := virtualAssets_pos; omega)
 
-private lemma deposit_extract {s s' : State} {user : Addr} {d : ℕ}
-    (hd : deposit s user d = some s') :
+private lemma deposit_extract {s s' : State} {user : Addr} {d k : ℕ}
+    (hd : deposit s user d = some (s', k)) :
     user ≠ vault ∧
-    s'.vaultToken.totalSupply = s.vaultToken.totalSupply + vaultTokenFor s d ∧
+    k = vaultTokenFor s d ∧
+    s'.vaultToken.totalSupply = s.vaultToken.totalSupply + k ∧
     vaultAssets s' = vaultAssets s + d := by
   unfold deposit at hd
   split at hd
@@ -263,17 +278,22 @@ private lemma deposit_extract {s s' : State} {user : Addr} {d : ℕ}
     split at hd
     · simp at hd
     case _ assetToken' htransferFrom =>
-      simp only [Option.some.injEq] at hd
-      subst hd
-      refine ⟨huv, rfl, ?_⟩
-      show assetToken'.balances vault = s.assetToken.balances vault + d
-      exact ERC20.transferFrom_balances_receiver huv htransferFrom
+      simp only [Option.some.injEq, Prod.mk.injEq] at hd
+      obtain ⟨hs', hk⟩ := hd
+      subst hs'
+      refine ⟨huv, hk.symm, ?_, ?_⟩
+      · show s.vaultToken.totalSupply + vaultTokenFor s d
+              = s.vaultToken.totalSupply + k
+        rw [hk]
+      · show assetToken'.balances vault = s.assetToken.balances vault + d
+        exact ERC20.transferFrom_balances_receiver huv htransferFrom
 
-private lemma mint_extract {s s' : State} {user : Addr} {k : ℕ}
-    (hm : mint s user k = some s') :
+private lemma mint_extract {s s' : State} {user : Addr} {k d : ℕ}
+    (hm : mint s user k = some (s', d)) :
     user ≠ vault ∧
+    d = mintCost s k ∧
     s'.vaultToken.totalSupply = s.vaultToken.totalSupply + k ∧
-    vaultAssets s' = vaultAssets s + mintCost s k := by
+    vaultAssets s' = vaultAssets s + d := by
   unfold mint at hm
   split at hm
   · simp at hm
@@ -281,18 +301,22 @@ private lemma mint_extract {s s' : State} {user : Addr} {k : ℕ}
     split at hm
     · simp at hm
     case _ assetToken' htransferFrom =>
-      simp only [Option.some.injEq] at hm
-      subst hm
-      refine ⟨huv, rfl, ?_⟩
-      show assetToken'.balances vault = s.assetToken.balances vault + mintCost s k
-      exact ERC20.transferFrom_balances_receiver huv htransferFrom
+      simp only [Option.some.injEq, Prod.mk.injEq] at hm
+      obtain ⟨hs', hd⟩ := hm
+      subst hs'
+      refine ⟨huv, hd.symm, rfl, ?_⟩
+      show assetToken'.balances vault = s.assetToken.balances vault + d
+      have := ERC20.transferFrom_balances_receiver huv htransferFrom
+      rw [hd] at this
+      exact this
 
-private lemma redeem_extract {s s' : State} {user : Addr} {k : ℕ}
-    (hr : redeem s user k = some s') :
+private lemma redeem_extract {s s' : State} {user : Addr} {k a : ℕ}
+    (hr : redeem s user k = some (s', a)) :
+    a = assetFor s k ∧
     k ≤ s.vaultToken.balances user ∧
     s'.vaultToken.totalSupply = s.vaultToken.totalSupply - k ∧
     (user = vault ∧ vaultAssets s' = vaultAssets s
-     ∨ user ≠ vault ∧ vaultAssets s' = vaultAssets s - assetFor s k) := by
+     ∨ user ≠ vault ∧ vaultAssets s' = vaultAssets s - a) := by
   unfold redeem at hr
   split at hr
   · simp at hr
@@ -300,8 +324,9 @@ private lemma redeem_extract {s s' : State} {user : Addr} {k : ℕ}
     split at hr
     · simp at hr
     case _ assetToken' htransferFrom =>
-      simp only [Option.some.injEq] at hr
-      subst hr
+      simp only [Option.some.injEq, Prod.mk.injEq] at hr
+      obtain ⟨hs', ha⟩ := hr
+      subst hs'
       have hkbal : k ≤ s.vaultToken.balances user := by
         unfold ERC20.burn at hburn
         split at hburn
@@ -312,7 +337,7 @@ private lemma redeem_extract {s s' : State} {user : Addr} {k : ℕ}
         split at hburn
         · simp at hburn
         · simp only [Option.some.injEq] at hburn; rw [← hburn]
-      refine ⟨hkbal, hsup, ?_⟩
+      refine ⟨ha.symm, hkbal, hsup, ?_⟩
       by_cases huv : user = vault
       · left
         refine ⟨huv, ?_⟩
@@ -321,14 +346,16 @@ private lemma redeem_extract {s s' : State} {user : Addr} {k : ℕ}
         exact ERC20.transferFrom_self_balances htransferFrom vault
       · right
         refine ⟨huv, ?_⟩
-        show assetToken'.balances vault = s.assetToken.balances vault - assetFor s k
+        show assetToken'.balances vault = s.assetToken.balances vault - a
         have h := ERC20.transferFrom_balances_sender_eq (Ne.symm huv) htransferFrom
+        rw [ha] at h
         exact h
 
-private lemma withdraw_extract {s s' : State} {user : Addr} {d : ℕ}
-    (hw : withdraw s user d = some s') :
-    withdrawCost s d ≤ s.vaultToken.balances user ∧
-    s'.vaultToken.totalSupply = s.vaultToken.totalSupply - withdrawCost s d ∧
+private lemma withdraw_extract {s s' : State} {user : Addr} {d k : ℕ}
+    (hw : withdraw s user d = some (s', k)) :
+    k = withdrawCost s d ∧
+    k ≤ s.vaultToken.balances user ∧
+    s'.vaultToken.totalSupply = s.vaultToken.totalSupply - k ∧
     (user = vault ∧ vaultAssets s' = vaultAssets s
      ∨ user ≠ vault ∧ vaultAssets s' = vaultAssets s - d) := by
   unfold withdraw at hw
@@ -338,8 +365,9 @@ private lemma withdraw_extract {s s' : State} {user : Addr} {d : ℕ}
     split at hw
     · simp at hw
     case _ assetToken' htransferFrom =>
-      simp only [Option.some.injEq] at hw
-      subst hw
+      simp only [Option.some.injEq, Prod.mk.injEq] at hw
+      obtain ⟨hs', hk⟩ := hw
+      subst hs'
       have hkbal : withdrawCost s d ≤ s.vaultToken.balances user := by
         unfold ERC20.burn at hburn
         split at hburn
@@ -351,17 +379,19 @@ private lemma withdraw_extract {s s' : State} {user : Addr} {d : ℕ}
         split at hburn
         · simp at hburn
         · simp only [Option.some.injEq] at hburn; rw [← hburn]
-      refine ⟨hkbal, hsup, ?_⟩
-      by_cases huv : user = vault
-      · left
-        refine ⟨huv, ?_⟩
-        show assetToken'.balances vault = s.assetToken.balances vault
-        subst huv
-        exact ERC20.transferFrom_self_balances htransferFrom vault
-      · right
-        refine ⟨huv, ?_⟩
-        show assetToken'.balances vault = s.assetToken.balances vault - d
-        exact ERC20.transferFrom_balances_sender_eq (Ne.symm huv) htransferFrom
+      refine ⟨hk.symm, ?_, ?_, ?_⟩
+      · rw [← hk]; exact hkbal
+      · rw [← hk]; exact hsup
+      · by_cases huv : user = vault
+        · left
+          refine ⟨huv, ?_⟩
+          show assetToken'.balances vault = s.assetToken.balances vault
+          subst huv
+          exact ERC20.transferFrom_self_balances htransferFrom vault
+        · right
+          refine ⟨huv, ?_⟩
+          show assetToken'.balances vault = s.assetToken.balances vault - d
+          exact ERC20.transferFrom_balances_sender_eq (Ne.symm huv) htransferFrom
 
 private lemma profit_extract (s : State) (d : ℕ) :
     (profit s d).vaultToken = s.vaultToken ∧
@@ -382,56 +412,55 @@ private lemma burn_total_le {s : ERC20.State} (h : ERC20.Invariant s) (u : ERC20
   omega
 
 private lemma deposit_preserves_VaultTokenPriceLE
-    {s s' : State} {user : Addr} {d : ℕ}
-    (hd : deposit s user d = some s') :
+    {s s' : State} {user : Addr} {d k : ℕ}
+    (hd : deposit s user d = some (s', k)) :
     VaultTokenPriceLE s s' := by
-  obtain ⟨_, htT, htA⟩ := deposit_extract hd
+  obtain ⟨_, hk, htT, htA⟩ := deposit_extract hd
   unfold VaultTokenPriceLE
   set B := vaultAssets s
   set T := s.vaultToken.totalSupply
   rw [htT, htA]
-  have hbound : vaultTokenFor s d * (B + virtualAssets)
-              ≤ d * (T + virtualTokens) := vaultTokenFor_bound s d
-  have el :
-      (B + virtualAssets) * (T + vaultTokenFor s d + virtualTokens)
-      = (B + virtualAssets) * (T + virtualTokens)
-      + (B + virtualAssets) * vaultTokenFor s d := by ring
-  have er :
-      (B + d + virtualAssets) * (T + virtualTokens)
-      = (B + virtualAssets) * (T + virtualTokens)
-      + d * (T + virtualTokens) := by ring
-  have hcomm : (B + virtualAssets) * vaultTokenFor s d
-             = vaultTokenFor s d * (B + virtualAssets) := by ring
-  omega
-
-private lemma mint_preserves_VaultTokenPriceLE
-    {s s' : State} {user : Addr} {k : ℕ}
-    (hm : mint s user k = some s') :
-    VaultTokenPriceLE s s' := by
-  obtain ⟨_, htT, htA⟩ := mint_extract hm
-  unfold VaultTokenPriceLE
-  set B := vaultAssets s
-  set T := s.vaultToken.totalSupply
-  rw [htT, htA]
-  have hbound : k * (B + virtualAssets)
-              ≤ mintCost s k * (T + virtualTokens) := mintCost_bound s k
+  have hbound : k * (B + virtualAssets) ≤ d * (T + virtualTokens) := by
+    rw [hk]; exact vaultTokenFor_bound s d
   have el :
       (B + virtualAssets) * (T + k + virtualTokens)
       = (B + virtualAssets) * (T + virtualTokens)
       + (B + virtualAssets) * k := by ring
   have er :
-      (B + mintCost s k + virtualAssets) * (T + virtualTokens)
+      (B + d + virtualAssets) * (T + virtualTokens)
       = (B + virtualAssets) * (T + virtualTokens)
-      + mintCost s k * (T + virtualTokens) := by ring
+      + d * (T + virtualTokens) := by ring
+  have hcomm : (B + virtualAssets) * k = k * (B + virtualAssets) := by ring
+  omega
+
+private lemma mint_preserves_VaultTokenPriceLE
+    {s s' : State} {user : Addr} {k d : ℕ}
+    (hm : mint s user k = some (s', d)) :
+    VaultTokenPriceLE s s' := by
+  obtain ⟨_, hd, htT, htA⟩ := mint_extract hm
+  unfold VaultTokenPriceLE
+  set B := vaultAssets s
+  set T := s.vaultToken.totalSupply
+  rw [htT, htA]
+  have hbound : k * (B + virtualAssets) ≤ d * (T + virtualTokens) := by
+    rw [hd]; exact mintCost_bound s k
+  have el :
+      (B + virtualAssets) * (T + k + virtualTokens)
+      = (B + virtualAssets) * (T + virtualTokens)
+      + (B + virtualAssets) * k := by ring
+  have er :
+      (B + d + virtualAssets) * (T + virtualTokens)
+      = (B + virtualAssets) * (T + virtualTokens)
+      + d * (T + virtualTokens) := by ring
   have hcomm : (B + virtualAssets) * k = k * (B + virtualAssets) := by ring
   omega
 
 private lemma redeem_preserves_VaultTokenPriceLE
-    {s s' : State} {user : Addr} {k : ℕ}
+    {s s' : State} {user : Addr} {k a : ℕ}
     (hvt : ERC20.Invariant s.vaultToken)
-    (hr : redeem s user k = some s') :
+    (hr : redeem s user k = some (s', a)) :
     VaultTokenPriceLE s s' := by
-  obtain ⟨hkbal, htT, hcase⟩ := redeem_extract hr
+  obtain ⟨ha, hkbal, htT, hcase⟩ := redeem_extract hr
   have hkT : k ≤ s.vaultToken.totalSupply :=
     le_trans hkbal (burn_total_le hvt user)
   unfold VaultTokenPriceLE
@@ -443,9 +472,9 @@ private lemma redeem_preserves_VaultTokenPriceLE
     have : T - k + virtualTokens ≤ T + virtualTokens := by omega
     exact Nat.mul_le_mul_left _ this
   · rw [hVA]
-    have hbound : assetFor s k * (T + virtualTokens)
-                ≤ k * (B + virtualAssets) := assetFor_bound s k
-    have hassets : assetFor s k ≤ B := by
+    have hbound : a * (T + virtualTokens) ≤ k * (B + virtualAssets) := by
+      rw [ha]; exact assetFor_bound s k
+    have hassets : a ≤ B := by
       unfold redeem at hr
       split at hr
       · simp at hr
@@ -456,7 +485,10 @@ private lemma redeem_preserves_VaultTokenPriceLE
           unfold ERC20.transferFrom at htr
           split at htr
           · simp at htr
-          · next h => simp only [not_lt] at h; exact h
+          · next h =>
+            simp only [not_lt] at h
+            -- `h : assetFor s k ≤ s.assetToken.balances vault = B`.
+            rw [ha]; exact h
     have el :
         (B + virtualAssets) * (T - k + virtualTokens)
         + (B + virtualAssets) * k
@@ -465,36 +497,34 @@ private lemma redeem_preserves_VaultTokenPriceLE
       have : T - k + virtualTokens + k = T + virtualTokens := by omega
       rw [this]
     have er :
-        (B - assetFor s k + virtualAssets) * (T + virtualTokens)
-        + assetFor s k * (T + virtualTokens)
+        (B - a + virtualAssets) * (T + virtualTokens)
+        + a * (T + virtualTokens)
         = (B + virtualAssets) * (T + virtualTokens) := by
       rw [← Nat.add_mul]
-      have : B - assetFor s k + virtualAssets + assetFor s k
-           = B + virtualAssets := by omega
+      have : B - a + virtualAssets + a = B + virtualAssets := by omega
       rw [this]
     have hcomm : (B + virtualAssets) * k = k * (B + virtualAssets) := by ring
     omega
 
 private lemma withdraw_preserves_VaultTokenPriceLE
-    {s s' : State} {user : Addr} {d : ℕ}
+    {s s' : State} {user : Addr} {d k : ℕ}
     (hvt : ERC20.Invariant s.vaultToken)
-    (hw : withdraw s user d = some s') :
+    (hw : withdraw s user d = some (s', k)) :
     VaultTokenPriceLE s s' := by
-  obtain ⟨hkbal, htT, hcase⟩ := withdraw_extract hw
-  have hkT : withdrawCost s d ≤ s.vaultToken.totalSupply :=
+  obtain ⟨hk, hkbal, htT, hcase⟩ := withdraw_extract hw
+  have hkT : k ≤ s.vaultToken.totalSupply :=
     le_trans hkbal (burn_total_le hvt user)
   unfold VaultTokenPriceLE
   set B := vaultAssets s
   set T := s.vaultToken.totalSupply
-  set k' := withdrawCost s d
   rw [htT]
   rcases hcase with ⟨_, hVA⟩ | ⟨_, hVA⟩
   · rw [hVA]
-    have : T - k' + virtualTokens ≤ T + virtualTokens := by omega
+    have : T - k + virtualTokens ≤ T + virtualTokens := by omega
     exact Nat.mul_le_mul_left _ this
   · rw [hVA]
-    have hbound : d * (T + virtualTokens)
-                ≤ k' * (B + virtualAssets) := withdrawCost_bound s d
+    have hbound : d * (T + virtualTokens) ≤ k * (B + virtualAssets) := by
+      rw [hk]; exact withdrawCost_bound s d
     have hassets : d ≤ B := by
       unfold withdraw at hw
       split at hw
@@ -508,11 +538,11 @@ private lemma withdraw_preserves_VaultTokenPriceLE
           · simp at htr
           · next h => simp only [not_lt] at h; exact h
     have el :
-        (B + virtualAssets) * (T - k' + virtualTokens)
-        + (B + virtualAssets) * k'
+        (B + virtualAssets) * (T - k + virtualTokens)
+        + (B + virtualAssets) * k
         = (B + virtualAssets) * (T + virtualTokens) := by
       rw [← Nat.mul_add]
-      have : T - k' + virtualTokens + k' = T + virtualTokens := by omega
+      have : T - k + virtualTokens + k = T + virtualTokens := by omega
       rw [this]
     have er :
         (B - d + virtualAssets) * (T + virtualTokens)
@@ -521,7 +551,7 @@ private lemma withdraw_preserves_VaultTokenPriceLE
       rw [← Nat.add_mul]
       have : B - d + virtualAssets + d = B + virtualAssets := by omega
       rw [this]
-    have hcomm : (B + virtualAssets) * k' = k' * (B + virtualAssets) := by ring
+    have hcomm : (B + virtualAssets) * k = k * (B + virtualAssets) := by ring
     omega
 
 private lemma profit_preserves_VaultTokenPriceLE (s : State) (d : ℕ) :
@@ -547,13 +577,29 @@ theorem step_preserves_VaultTokenPriceLE
     VaultTokenPriceLE s s' := by
   cases a with
   | deposit u amt   =>
-    exact deposit_preserves_VaultTokenPriceLE hstep
+    change (deposit s u amt).map Prod.fst = some s' at hstep
+    rw [Option.map_eq_some_iff] at hstep
+    obtain ⟨⟨_, _⟩, hd, heq⟩ := hstep
+    cases heq
+    exact deposit_preserves_VaultTokenPriceLE hd
   | mint u tk       =>
-    exact mint_preserves_VaultTokenPriceLE hstep
+    change (mint s u tk).map Prod.fst = some s' at hstep
+    rw [Option.map_eq_some_iff] at hstep
+    obtain ⟨⟨_, _⟩, hm, heq⟩ := hstep
+    cases heq
+    exact mint_preserves_VaultTokenPriceLE hm
   | withdraw u amt  =>
-    exact withdraw_preserves_VaultTokenPriceLE hvt hstep
+    change (withdraw s u amt).map Prod.fst = some s' at hstep
+    rw [Option.map_eq_some_iff] at hstep
+    obtain ⟨⟨_, _⟩, hw, heq⟩ := hstep
+    cases heq
+    exact withdraw_preserves_VaultTokenPriceLE hvt hw
   | redeem u tk     =>
-    exact redeem_preserves_VaultTokenPriceLE hvt hstep
+    change (redeem s u tk).map Prod.fst = some s' at hstep
+    rw [Option.map_eq_some_iff] at hstep
+    obtain ⟨⟨_, _⟩, hr, heq⟩ := hstep
+    cases heq
+    exact redeem_preserves_VaultTokenPriceLE hvt hr
   | profit amt      =>
     simp only [step, Option.some.injEq] at hstep
     subst hstep

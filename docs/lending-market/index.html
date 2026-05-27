@@ -1,0 +1,614 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Formal Verification of the Morpho Market Core Logic in Lean 4</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<nav class="top">
+  <div class="wrap">
+    <div class="brand">Morpho Market · Lean 4</div>
+    <div class="links">
+      <a href="#scope">Scope</a>
+      <a href="#operations">Operations</a>
+      <a href="#lifecycle">Lifecycle</a>
+      <a href="#theorems">Theorems</a>
+    </div>
+  </div>
+</nav>
+
+<header class="hero">
+  <div class="wrap">
+    <h1>Formal verification of the Morpho Market core logic, in Lean 4.</h1>
+    <p class="lede">
+      We model the core logic of Morpho Market and prove that its
+      safety-critical properties hold across every protocol action.
+      Every theorem is machine-checked by Lean.
+    </p>
+  </div>
+</header>
+
+<!-- ============================================================ -->
+<section id="scope">
+  <div class="wrap">
+    <h2>What this model is (and isn't)</h2>
+    <p class="section-lede">
+      Our Lean model sits between paper proofs (exact arithmetic, no
+      rounding) and the Solidity implementation (access control, oracle
+      integration, interest rate model, callbacks, and so on). We
+      capture the math with fixed-point arithmetic — accounting for
+      every rounding error — and abstract price changes and interest
+      accruals as <em>environment actions</em>, separated from
+      <em>user operations</em>.
+    </p>
+
+    <div class="scope-single">
+      <div class="scope-card">
+        <svg viewBox="0 0 480 380" xmlns="http://www.w3.org/2000/svg"
+             aria-label="Model scope as nested layers">
+          <!-- Outer (Solidity) -->
+          <rect x="20" y="20" width="440" height="340"
+                fill="#b8d2e5" stroke="#1d4a7a" stroke-width="1.5" rx="10"/>
+          <text x="240" y="46" text-anchor="middle"
+                style="font: 600 13px var(--sans); fill: #1d4a7a;">
+            Solidity implementation
+          </text>
+
+          <!-- Middle (Lean) -->
+          <rect x="55" y="76" width="370" height="240"
+                fill="#d6e6f2" stroke="#3a6a8a" stroke-width="1.5" rx="10"/>
+          <text x="240" y="102" text-anchor="middle"
+                style="font: 600 13px var(--sans); fill: #2a4a6a;">
+            Our Lean model
+          </text>
+
+          <!-- Inner (Paper) -->
+          <rect x="95" y="132" width="290" height="90"
+                fill="#f0f6fb" stroke="#6b8aa0" stroke-width="1.5" rx="10"/>
+          <text x="240" y="168" text-anchor="middle"
+                style="font: 600 13px var(--sans); fill: #3a5a7a;">
+            Paper model
+          </text>
+          <text x="240" y="192" text-anchor="middle"
+                style="font: 12px var(--sans); fill: #555;">
+            core market logic (exact real arithmetic)
+          </text>
+
+          <!-- Lean's additions -->
+          <text x="240" y="250" text-anchor="middle"
+                style="font: 12px var(--sans); fill: #2a4a6a;">
+            + fixed-point arithmetic, all rounding errors
+          </text>
+          <text x="240" y="276" text-anchor="middle"
+                style="font: 12px var(--sans); fill: #2a4a6a;">
+            + price changes &amp; interest accruals
+          </text>
+          <text x="240" y="294" text-anchor="middle"
+                style="font: 11px var(--sans); fill: #4a6680;">
+            (abstracted as environment actions)
+          </text>
+
+          <!-- Solidity's additions -->
+          <text x="240" y="340" text-anchor="middle"
+                style="font: 12px var(--sans); fill: #1d4a7a;">
+            + concrete price oracle &amp; IRM, access control, callbacks, …
+          </text>
+        </svg>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section id="operations">
+  <div class="wrap">
+    <h2>Market operations</h2>
+    <p class="section-lede">
+      The market revolves around three pools — a <strong>supply</strong>
+      pool that funds borrows, a <strong>borrow</strong> pool that
+      tracks each borrower's debt, and a <strong>collateral</strong>
+      pool that backs each position. Seven user operations move assets
+      in and out of these pools — including <code>liquidate</code>,
+      which any external user (the liquidator) can call against an
+      unhealthy borrower. Interest accrual is the one environment
+      action: it inflates the borrow and supply pools by the same
+      amount, with no user trigger.
+    </p>
+
+    <div class="arch-wrap">
+      <svg viewBox="0 0 1020 580" xmlns="http://www.w3.org/2000/svg"
+           aria-label="Market operations and pools">
+        <defs>
+          <marker id="op-arr-user" viewBox="0 0 10 10" refX="9" refY="5"
+                  markerWidth="7" markerHeight="7" orient="auto">
+            <path d="M0,0 L10,5 L0,10 z" fill="#0d4a7a"/>
+          </marker>
+          <marker id="op-arr-env" viewBox="0 0 10 10" refX="9" refY="5"
+                  markerWidth="7" markerHeight="7" orient="auto">
+            <path d="M0,0 L10,5 L0,10 z" fill="#b45309"/>
+          </marker>
+          <style>
+            .pool-supply { fill: #d6e6f2; stroke: #3a6a8a; stroke-width: 1.5; }
+            .pool-borrow { fill: #f0f6fb; stroke: #6b8aa0; stroke-width: 1.5; }
+            .pool-coll   { fill: #ecfdf5; stroke: #16a34a; stroke-width: 1.5; }
+            .pool-name   { font: 600 18px -apple-system, system-ui, sans-serif;
+                           fill: #1a1a1a; }
+            .op-user     { stroke: #0d4a7a; stroke-width: 1.8; fill: none; }
+            .op-env      { stroke: #b45309; stroke-width: 1.8; fill: none; }
+            .op-label    { font: 14px -apple-system, system-ui, sans-serif;
+                           fill: #333; }
+          </style>
+        </defs>
+
+        <!-- legend (top-left) -->
+        <g transform="translate(40, 30)">
+          <line class="op-user" x1="0" y1="6"  x2="22" y2="6"  marker-end="url(#op-arr-user)"/>
+          <text class="op-label" x="30" y="10">user op</text>
+          <line class="op-env"  x1="0" y1="30" x2="22" y2="30" marker-end="url(#op-arr-env)"/>
+          <text class="op-label" x="30" y="34">environment</text>
+        </g>
+
+        <!-- SUPPLY pool (outer) -->
+        <rect class="pool-supply" x="160" y="100" width="580" height="240" rx="22"/>
+        <text class="pool-name" x="200" y="138">supply</text>
+
+        <!-- BORROW pool (nested in supply, flush with supply's right edge) -->
+        <rect class="pool-borrow" x="370" y="160" width="370" height="160" rx="20"/>
+        <text class="pool-name" x="555" y="220" text-anchor="middle">borrow</text>
+
+        <!-- COLLATERAL pool -->
+        <rect class="pool-coll" x="260" y="400" width="480" height="140" rx="22"/>
+        <text class="pool-name" x="295" y="438">collateral</text>
+
+        <!-- supply IN (left) -->
+        <line class="op-user" x1="70" y1="180" x2="155" y2="180" marker-end="url(#op-arr-user)"/>
+        <text class="op-label" x="80" y="170">supply</text>
+
+        <!-- withdraw OUT (left) -->
+        <line class="op-user" x1="155" y1="270" x2="70" y2="270" marker-end="url(#op-arr-user)"/>
+        <text class="op-label" x="80" y="292">withdraw</text>
+
+        <!-- liquidate (top, into borrow) -->
+        <line class="op-user" x1="460" y1="60" x2="460" y2="155" marker-end="url(#op-arr-user)"/>
+        <text class="op-label" x="460" y="50" text-anchor="middle">liquidate</text>
+
+        <!-- accrue interest (top, into borrow) -->
+        <line class="op-env" x1="650" y1="60" x2="650" y2="155" marker-end="url(#op-arr-env)"/>
+        <text class="op-label" x="650" y="50" text-anchor="middle">accrue interest</text>
+
+        <!-- repay IN (right) -->
+        <line class="op-user" x1="855" y1="200" x2="745" y2="200" marker-end="url(#op-arr-user)"/>
+        <text class="op-label" x="865" y="195">repay</text>
+
+        <!-- borrow OUT (right) -->
+        <line class="op-user" x1="745" y1="275" x2="855" y2="275" marker-end="url(#op-arr-user)"/>
+        <text class="op-label" x="865" y="282">borrow</text>
+
+        <!-- add collateral IN (right) -->
+        <line class="op-user" x1="855" y1="440" x2="745" y2="440" marker-end="url(#op-arr-user)"/>
+        <text class="op-label" x="865" y="435">add collateral</text>
+
+        <!-- remove collateral OUT (right) -->
+        <line class="op-user" x1="745" y1="500" x2="855" y2="500" marker-end="url(#op-arr-user)"/>
+        <text class="op-label" x="865" y="506">remove collateral</text>
+      </svg>
+      <p class="diagram-note">
+        <em>Note on modeling.</em> In real lending implementations,
+        <code>accrueInterest</code> is not a
+        standalone call — it is folded into every user operation,
+        running at the start before the user's intent is processed. We
+        model it as a distinct <em>environment</em> action so the
+        proofs can talk about user effects and interest effects
+        independently — for example, "this property holds across every
+        user action <em>when no interest accrues in between</em>".
+        The two model views are equivalent: any concrete user op in
+        practice is just an <code>envAccrueInt</code> immediately
+        followed by the corresponding <code>user…</code> action in our
+        model.
+      </p>
+    </div>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section id="lifecycle">
+  <div class="wrap">
+    <h2>How positions move through the market</h2>
+    <p class="section-lede">
+      Every borrower position lives in one of five regions, organized by
+      how a position can leave them. Regions are defined using
+      <span class="mono">ltv := debt / (collateral · price)</span> and the
+      two protocol constants <span class="mono">lltv</span> (the LLTV
+      threshold) and <span class="mono">incentive</span> (the liquidation
+      incentive factor). A <strong>Healable</strong> position can be
+      fully liquidated back to <strong>Healthy</strong>. Once a position
+      enters the <strong>Bad-debt path</strong>, a full liquidation is no
+      longer possible — the liquidation incentive cannot be covered by
+      the remaining collateral. Only repeated partial liquidations work,
+      and they only drain collateral until the position is
+      <strong>Insolvent</strong>. From there, only <code>writeOff</code>
+      can clear the debt — at which point the loss is realized and
+      socialized among lenders.
+    </p>
+
+    <div class="arch-wrap">
+      <svg viewBox="0 0 960 770" xmlns="http://www.w3.org/2000/svg"
+           aria-label="Borrower lifecycle across regions">
+        <defs>
+          <marker id="arr-env" viewBox="0 0 10 10" refX="9" refY="5"
+                  markerWidth="6" markerHeight="6" orient="auto">
+            <path d="M0,0 L10,5 L0,10 z" fill="#b45309"/>
+          </marker>
+          <marker id="arr-user" viewBox="0 0 10 10" refX="9" refY="5"
+                  markerWidth="6" markerHeight="6" orient="auto">
+            <path d="M0,0 L10,5 L0,10 z" fill="#0d4a7a"/>
+          </marker>
+          <style>
+            .reg-healthy   { fill: #ecfdf5; stroke: #16a34a; stroke-width: 1.5; }
+            .reg-healable  { fill: #fef6e7; stroke: #b45309; stroke-width: 1.5; }
+            .reg-baddebt   { fill: #fef2f2; stroke: #b91c1c; stroke-width: 1.5; }
+            .reg-insolvent { fill: #fee2e2; stroke: #991b1b; stroke-width: 1.5; }
+            .reg-cleared   { fill: #f3f4f6; stroke: #888;    stroke-width: 1; }
+            .reg-title { font: 600 15px -apple-system, system-ui, sans-serif;
+                         fill: #1a1a1a; letter-spacing: 0.04em; }
+            .reg-sub   { font: 13px -apple-system, system-ui, sans-serif;
+                         fill: #555; }
+            .reg-cond  { font: 12px ui-monospace, Menlo, monospace;
+                         fill: #666; }
+            .edge-env  { stroke: #b45309; stroke-width: 1.8; fill: none; }
+            .edge-user { stroke: #0d4a7a; stroke-width: 1.8; fill: none; }
+            .edge-label { font: 12px -apple-system, system-ui, sans-serif;
+                          fill: #333; }
+            .edge-thm   { font: 11px ui-monospace, Menlo, monospace;
+                          fill: #888; }
+          </style>
+        </defs>
+
+        <!-- legend (top-left) -->
+        <g transform="translate(40, 30)">
+          <line class="edge-user" x1="0" y1="6" x2="22" y2="6" marker-end="url(#arr-user)"/>
+          <text class="edge-label" x="30" y="10">user-triggered</text>
+          <line class="edge-env" x1="0" y1="30" x2="22" y2="30" marker-end="url(#arr-env)"/>
+          <text class="edge-label" x="30" y="34">environment</text>
+        </g>
+
+        <!-- HEALTHY -->
+        <rect class="reg-healthy" x="200" y="30" width="500" height="90" rx="12"/>
+        <text class="reg-title" x="450" y="60"  text-anchor="middle">HEALTHY</text>
+        <text class="reg-sub"   x="450" y="82"  text-anchor="middle">Borrower has the LLTV buffer.</text>
+        <text class="reg-cond"  x="450" y="106" text-anchor="middle">ltv  ≤  lltv</text>
+
+        <!-- self-loop on Healthy -->
+        <path class="edge-user" d="M695,52 C 780,38 780,108 695,94" marker-end="url(#arr-user)"/>
+        <text class="edge-label" x="795" y="64" text-anchor="start">user ops</text>
+        <text class="edge-label" x="795" y="80" text-anchor="start">(price-stable,</text>
+        <text class="edge-label" x="795" y="96" text-anchor="start">no accrual)</text>
+
+        <!-- HEALTHY → HEALABLE (env, left) -->
+        <path class="edge-env" d="M350,120 L350,190" marker-end="url(#arr-env)"/>
+        <text class="edge-label" x="340" y="146" text-anchor="end">envAccrueInt</text>
+        <text class="edge-label" x="340" y="164" text-anchor="end">envPriceTick</text>
+        <text class="edge-label" x="340" y="182" text-anchor="end">(small)</text>
+
+        <!-- HEALABLE → HEALTHY (user, full burn liquidation) -->
+        <path class="edge-user" d="M550,190 L550,120" marker-end="url(#arr-user)"/>
+        <text class="edge-label" x="560" y="148" text-anchor="start">liquidate (full burn)</text>
+        <text class="edge-thm"   x="560" y="166" text-anchor="start">exists_full_liquidation_to_healthy</text>
+
+        <!-- HEALABLE -->
+        <rect class="reg-healable" x="200" y="190" width="500" height="90" rx="12"/>
+        <text class="reg-title" x="450" y="220" text-anchor="middle">HEALABLE</text>
+        <text class="reg-sub"   x="450" y="242" text-anchor="middle">Past the LLTV buffer, but full liquidation is still possible.</text>
+        <text class="reg-cond"  x="450" y="266" text-anchor="middle">lltv  &lt;  ltv  ≤  1 / incentive</text>
+
+        <!-- self-loop on Healable -->
+        <path class="edge-user" d="M695,212 C 780,198 780,268 695,254" marker-end="url(#arr-user)"/>
+        <text class="edge-label" x="795" y="234" text-anchor="start">liquidate</text>
+        <text class="edge-label" x="795" y="250" text-anchor="start">(partial)</text>
+
+        <!-- HEALABLE → BADDEBT (env, centered) -->
+        <path class="edge-env" d="M450,280 L450,360" marker-end="url(#arr-env)"/>
+        <text class="edge-label" x="460" y="306" text-anchor="start">envAccrueInt past budget</text>
+        <text class="edge-label" x="460" y="324" text-anchor="start">envPriceTick past 1/incentive</text>
+
+        <!-- BAD DEBT PATH -->
+        <rect class="reg-baddebt" x="200" y="360" width="500" height="110" rx="12"/>
+        <text class="reg-title" x="450" y="390" text-anchor="middle">BAD DEBT PATH</text>
+        <text class="reg-sub"   x="450" y="412" text-anchor="middle">Full liquidation fails — liquidation incentive exceeds collateral value.</text>
+        <text class="reg-sub"   x="450" y="430" text-anchor="middle">Partial liquidation can never bring a position back to Healthy.</text>
+        <text class="reg-cond"  x="450" y="454" text-anchor="middle">ltv  &gt;  1 / incentive</text>
+
+        <!-- self-loop on BadDebt -->
+        <path class="edge-user" d="M695,382 C 780,368 780,448 695,434" marker-end="url(#arr-user)"/>
+        <text class="edge-label" x="795" y="394" text-anchor="start">liquidate (partial)</text>
+        <text class="edge-thm"   x="795" y="410" text-anchor="start">liquidate_preserves_</text>
+        <text class="edge-thm"   x="795" y="424" text-anchor="start">bad_debt_path</text>
+
+        <!-- BAD DEBT → INSOLVENT (user, centered, repeated liquidations) -->
+        <path class="edge-user" d="M450,470 L450,540" marker-end="url(#arr-user)"/>
+        <text class="edge-label" x="460" y="510" text-anchor="start">repeated partial liquidations drain collateral</text>
+
+        <!-- INSOLVENT -->
+        <rect class="reg-insolvent" x="200" y="540" width="500" height="80" rx="12"/>
+        <text class="reg-title" x="450" y="570" text-anchor="middle">INSOLVENT · defaulted</text>
+        <text class="reg-sub"   x="450" y="592" text-anchor="middle">All collateral seized; debt remains.</text>
+        <text class="reg-cond"  x="450" y="612" text-anchor="middle">collateral = 0,   debt &gt; 0</text>
+
+        <!-- INSOLVENT → CLEARED (env writeOff, loss realized) -->
+        <path class="edge-env" d="M450,620 L450,700" marker-end="url(#arr-env)"/>
+        <text class="edge-label" x="460" y="646" text-anchor="start" style="font-weight:600;">envWriteOff</text>
+        <text class="edge-label" x="460" y="664" text-anchor="start" style="fill:#b91c1c; font-weight:600;">→ loss realized,</text>
+        <text class="edge-label" x="460" y="680" text-anchor="start" style="fill:#b91c1c; font-weight:600;">socialized among lenders</text>
+        <text class="edge-thm"   x="440" y="654" text-anchor="end">writeOff_clears_debt</text>
+
+        <!-- CLEARED -->
+        <rect class="reg-cleared" x="300" y="700" width="300" height="60" rx="10"/>
+        <text class="reg-title" x="450" y="728" text-anchor="middle" style="font-size: 14px;">CLEARED</text>
+        <text class="reg-cond"  x="450" y="748" text-anchor="middle">debt = 0,  position removed</text>
+      </svg>
+      <p class="diagram-note">
+        <em>Not shown:</em> <code>repay</code> reduces a borrower's debt
+        and <code>supplyCollateral</code> adds collateral, so either can
+        also move a position toward a lower-debt region — including
+        directly to <strong>Cleared</strong> if the entire debt is
+        repaid. Both are omitted above to keep the focus on the
+        liquidation story.
+      </p>
+    </div>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section id="theorems">
+  <div class="wrap">
+    <h2>Headline theorems</h2>
+    <p class="section-lede">
+      Each card states the property in plain English first; toggle to
+      see the Lean statement, and click through to the full proof on
+      GitHub.
+    </p>
+
+    <div class="thms">
+
+      <!-- 2. step_preserves_allHealthy -->
+      <div class="thm">
+        <h3>No user operation makes a healthy position unhealthy.
+          <span class="nm">· step_preserves_allHealthy</span>
+        </h3>
+        <p class="plain">
+          After any user operation, every borrower who had the LLTV
+          buffer before still has the LLTV buffer after. Borrows and
+          collateral withdrawals are explicitly gated on the new state
+          being healthy at the observed price.
+        </p>
+        <details>
+          <summary>Show Lean statement</summary>
+<pre><span class="kw">theorem</span> <span class="name">step_preserves_allHealthy</span>
+    {a : Action} {w w' : World}
+    (h_pm : NoPriceMove a) (h_acc : NoAccrual a)
+    (hbk : Bookkeep w) (hAH : AllHealthy w)
+    (hstep : step a w = some w') : AllHealthy w'</pre>
+        </details>
+        <div class="footer">
+          <a href="https://github.com/daejunpark/lean-defi-guide/blob/main/lending-market/Proofs/AllHealthy.lean#L456">View full proof on GitHub →</a>
+        </div>
+      </div>
+
+      <!-- 3. step_remains_assetCovered_under_allHealthy -->
+      <div class="thm">
+        <h3>From a healthy market, every action keeps the protocol solvent — under closed-form budgets.
+          <span class="nm">· step_remains_assetCovered_under_allHealthy</span>
+        </h3>
+        <p class="plain">
+          Starting from an AllHealthy market, every user operation and
+          every environment action leaves the protocol fully solvent —
+          total debt covered by collateral at the observed price.
+          Environment actions are gated by two closed-form budgets:
+        </p>
+        <ul class="plain-list">
+          <li>
+            <a href="https://github.com/daejunpark/lean-defi-guide/blob/main/lending-market/Defs/Predicates.lean#L54"><code>PriceMoveBudget</code></a> caps how far the oracle price
+            can drop in a single tick. The new price
+            <span class="mono">p'</span> must satisfy
+            <span class="mono">lltv · p ≤ p'</span> — a tick can erase
+            at most a factor of <span class="mono">1 − lltv</span> of
+            the price, exactly the room a marginal AllHealthy borrower
+            has before crossing into insolvency.
+          </li>
+          <li>
+            <a href="https://github.com/daejunpark/lean-defi-guide/blob/main/lending-market/Defs/Predicates.lean#L46"><code>AccrualBudget</code></a> caps how much interest can
+            accrue at once. The accrued amount
+            <span class="mono">Δ</span> must satisfy
+            <span class="mono">Δ · lltv ≤ totalBorrowAssets · (1 − lltv)</span>
+            — one accrual cannot consume more than the aggregate LTV
+            headroom across all borrowers.
+          </li>
+        </ul>
+        <details>
+          <summary>Show Lean statement</summary>
+<pre><span class="kw">theorem</span> <span class="name">step_remains_assetCovered_under_allHealthy</span>
+    {a : Action} {w w' : World}
+    (h_pmb : PriceMoveBudget a (w.oracle.read))
+    (hbk : Bookkeep w) (hAH : AllHealthy w)
+    (h_acb : AccrualBudget a w)
+    (hstep : step a w = some w') : AssetCovered w'</pre>
+        </details>
+        <div class="footer">
+          <a href="https://github.com/daejunpark/lean-defi-guide/blob/main/lending-market/Proofs/AllHealthyToAssetCovered.lean#L209">View full proof on GitHub →</a>
+        </div>
+      </div>
+
+      <!-- 5. liquidate_preserves_bad_debt_path -->
+      <div class="thm">
+        <h3>Once a position is past the point of no return, partial liquidation cannot rescue it.
+          <span class="nm">· liquidate_preserves_bad_debt_path</span>
+        </h3>
+        <p class="plain">
+          We partition unhealthy positions into a <em>healable</em>
+          region (liquidation profitable enough to fully cover the debt)
+          and a <em>bad-debt</em> region (debt-times-incentive already
+          exceeds collateral value). The bad-debt region is
+          <em>absorbing</em>: no partial liquidation moves a position
+          out of it.
+        </p>
+        <details>
+          <summary>Show Lean statement</summary>
+<pre><span class="kw">theorem</span> <span class="name">liquidate_preserves_bad_debt_path</span>
+    {w w' : World} {lq b : Addr} {sh seized : ℕ}
+    (hp : (0 : OraclePrice) &lt; w.oracle.read)
+    (hbk : Bookkeep w)
+    (hBDP : BadDebtPath w b)
+    (hl : liquidate w lq b sh = some (w', seized)) :
+    BadDebtPath w' b</pre>
+        </details>
+        <div class="footer">
+          <a href="https://github.com/daejunpark/lean-defi-guide/blob/main/lending-market/Proofs/Liquidation.lean#L309">View full proof on GitHub →</a>
+        </div>
+      </div>
+
+      <!-- 6. exists_full_liquidation_to_healthy -->
+      <div class="thm">
+        <h3>If a position is still healable, a single liquidation can heal it.
+          <span class="nm">· exists_full_liquidation_to_healthy</span>
+        </h3>
+        <p class="plain">
+          If a borrower is still in the <em>Healable</em> region —
+          their bonus-inflated debt is still covered by their collateral
+          at the observed price — then a single full-burn liquidation
+          can return the position to <em>Healthy</em>. This is the
+          constructive partner to the absorbing bad-debt theorem above,
+          completing the dichotomy: every unhealthy position is either
+          healable (one liquidation away from Healthy) or absorbing (no
+          liquidation can rescue it). The existence holds under one
+          closed-form budget:
+        </p>
+        <ul class="plain-list">
+          <li>
+            <a href="https://github.com/daejunpark/lean-defi-guide/blob/main/lending-market/Defs/Predicates.lean#L162"><code>HealableLiquidationBudget</code></a> requires the
+            borrower's coverage gap — collateral value minus
+            bonus-inflated debt — to be wide enough to absorb two
+            rounding wei. Letting <span class="mono">C</span> be the
+            borrower's collateral, <span class="mono">D</span> their
+            debt, <span class="mono">p</span> the oracle price, and
+            <span class="mono">α</span> the liquidation incentive
+            factor, the budget reads
+            <span class="mono">α + p ≤ C · p − α · D</span> — the
+            right-hand side is the coverage gap, the left-hand side is
+            one repay-rounding unit plus one collateral-rounding unit
+            valued at the current price.
+          </li>
+        </ul>
+        <details>
+          <summary>Show Lean statement</summary>
+<pre><span class="kw">theorem</span> <span class="name">exists_full_liquidation_to_healthy</span>
+    {w : World} {lq b : Addr}
+    (hp : (0 : OraclePrice) &lt; w.oracle.read)
+    (hUnhealthy : ¬ Healthy w b)
+    (hBudget : HealableLiquidationBudget w b)
+    (hLiquidatorFunds : LiquidatorHasFullRepayFunds w lq b)
+    (hAccounting : MarketAccounting w) :
+    ∃ sh w' seized,
+      liquidate w lq b sh = some (w', seized) ∧ Healthy w' b</pre>
+        </details>
+        <div class="footer">
+          <a href="https://github.com/daejunpark/lean-defi-guide/blob/main/lending-market/Proofs/Liquidation.lean#L676">View full proof on GitHub →</a>
+          <span>Morpho wishlist #708</span>
+        </div>
+      </div>
+
+      <!-- step_preserves_assetCovered -->
+      <div class="thm">
+        <h3>From a solvent market, every user operation keeps it solvent — under closed-form budgets.
+          <span class="nm">· step_preserves_assetCovered</span>
+        </h3>
+        <p class="plain">
+          Starting from an AssetCovered (solvent) market, every user
+          operation leaves the protocol solvent — total debt still
+          covered by collateral at the observed price. The two
+          share-burn actions — <code>userRepay</code> and
+          <code>userLiquidate</code> — are each gated by a closed-form
+          budget:
+        </p>
+        <ul class="plain-list">
+          <li>
+            <a href="https://github.com/daejunpark/lean-defi-guide/blob/main/lending-market/Defs/Predicates.lean#L213"><code>LiquidateStepBudget</code></a> fires for
+            <code>userLiquidate</code>: the targeted borrower must
+            satisfy the <a href="https://github.com/daejunpark/lean-defi-guide/blob/main/lending-market/Defs/Predicates.lean#L162"><code>HealableLiquidationBudget</code></a>
+            explained in the previous headline (coverage gap wide
+            enough to absorb two rounding wei). Outside this region,
+            partial liquidation mechanically drains collateral instead
+            of restoring solvency.
+          </li>
+          <li>
+            <a href="https://github.com/daejunpark/lean-defi-guide/blob/main/lending-market/Defs/Predicates.lean#L220"><code>BurnStepBudget</code></a> fires for both
+            <code>userRepay</code> and <code>userLiquidate</code>:
+            the asset cost of the share burn must stay inside the real
+            borrowed assets, not dip into the virtual borrow-asset
+            reserve. Letting <span class="mono">R</span> denote
+            <span class="mono">totalBorrowAssets</span> and
+            <span class="mono">sh</span> the number of debt shares
+            being burned, the budget reads
+            <span class="mono">repayCost(sh) ≤ R</span> — the burn's
+            asset cost stays within the real pool. Crossing this
+            threshold lifts the share-rate for every other borrower,
+            which can knock them into insolvency.
+          </li>
+        </ul>
+        <details>
+          <summary>Show Lean statement</summary>
+<pre><span class="kw">theorem</span> <span class="name">step_preserves_assetCovered</span>
+    {a : Action} {w w' : World}
+    (hp : 0 &lt; w.oracle.read_q)
+    (h_pm : NoPriceMove a) (h_acc : NoAccrual a)
+    (hbk : Bookkeep w) (hAC : AssetCovered w)
+    (h_liq : LiquidateStepBudget a w)
+    (h_burn : BurnStepBudget a w)
+    (hstep : step a w = some w') : AssetCovered w'</pre>
+        </details>
+        <div class="footer">
+          <a href="https://github.com/daejunpark/lean-defi-guide/blob/main/lending-market/Proofs/AssetCovered.lean#L772">View full proof on GitHub →</a>
+        </div>
+      </div>
+
+      <!-- 5. step_preserves_supplySharePriceLE -->
+      <div class="thm">
+        <h3>A supplier's position value cannot drop — except when bad debt is realized.
+          <span class="nm">· step_preserves_supplySharePriceLE</span>
+        </h3>
+        <p class="plain">
+          No user operation and no environment action can reduce a
+          supplier's position value. Suppliers are guaranteed never to
+          lose from protocol behavior — the single exception is
+          <code>envWriteOff</code>, when bad debt is realized and the
+          loss is socialized across all suppliers.
+        </p>
+        <details>
+          <summary>Show Lean statement</summary>
+<pre><span class="kw">theorem</span> <span class="name">step_preserves_supplySharePriceLE</span>
+    {a : Action} {w w' : World}
+    (h_nbd : NoBadDebt a) (hbk : Bookkeep w)
+    (hstep : step a w = some w') : SupplySharePriceLE w w'</pre>
+        </details>
+        <div class="footer">
+          <a href="https://github.com/daejunpark/lean-defi-guide/blob/main/lending-market/Proofs/SharePrice.lean#L207">View full proof on GitHub →</a>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</section>
+
+<footer class="site">
+  <div class="wrap">
+    <div>
+      Source:
+      <a href="https://github.com/daejunpark/lean-defi-guide">daejunpark/lean-defi-guide</a>.
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>

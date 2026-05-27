@@ -1,0 +1,408 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>When the Proof Refuses, You're Looking at an Attack.</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<nav class="top">
+  <div class="wrap">
+    <div class="brand"><a href="./">DeFi Formal Verification in Lean</a></div>
+    <div class="links">
+      <a href="https://github.com/daejunpark/lean-defi-guide">GitHub</a>
+    </div>
+  </div>
+</nav>
+
+<header class="hero">
+  <div class="wrap">
+    <p class="partof">Part 2 of an explainer series on formally verifying DeFi in Lean</p>
+    <h1>When the Proof Refuses, You're Looking at an Attack.</h1>
+  </div>
+</header>
+
+<article>
+<div class="wrap">
+
+<section>
+  <p>
+    <a href="part-1.html">Part 1</a> ended with the vault preserving its
+    token-price invariant: under every non-<code>loss</code> action,
+    the vault-token price never decreases. That rules out one whole
+    class of attacks &mdash; nobody round-trips through the vault and
+    walks out with more than they put in.
+  </p>
+
+  <p>
+    But "you can't profit from a round trip" is only half of what a
+    depositor cares about. The other half is the symmetric question:
+    if I round-trip a deposit, <em>how much do I lose to rounding?</em>
+    The floors in the vault's conversion formulas are tuned in the
+    vault's favor &mdash; that's how the first attack gets ruled out
+    &mdash; so some loss is unavoidable. The question is whether it's
+    bounded, by how much, and under what conditions.
+  </p>
+
+  <p>
+    This post turns "loss is bounded" into a machine-checked theorem.
+    The interesting part isn't the proof; the proof is mechanical.
+    The interesting part is that the <em>shape</em> of the side
+    conditions Lean forces on us turns out to be the same shape as a
+    well-known class of real-world attacks &mdash; and reading the
+    proved bound back against deployment reality is itself the
+    security analysis.
+  </p>
+</section>
+
+<section>
+  <h2>Asking for the obvious thing</h2>
+
+  <p>
+    The natural property to state is: <em>for any deposit
+    <code>a</code>, the round-trip loss is at most some small fraction
+    <code>&epsilon;</code> of <code>a</code>.</em>
+  </p>
+
+  <p>
+    To say this cleanly we move to <code>&Qopf;</code> &mdash; it's
+    awkward to express "0.01%" or "1 basis point" in <code>&Nopf;</code>
+    without manual cross-multiplications, and the Lean ecosystem
+    handles rationals well enough that there's no reason not to. The
+    tolerance <code>&epsilon;</code> becomes a parameter; pick any
+    positive rational.
+  </p>
+
+  <p>
+    The theorem we want is something like:
+  </p>
+
+<pre><span class="kw">theorem</span> <span class="name">deposit_then_redeem_loss_naive</span>
+    {s s' s'' : State} {user : Addr} {a shares assets_back : &Nopf;} {&epsilon; : &Qopf;}
+    (h&epsilon;_pos : 0 &lt; &epsilon;)
+    (hd : deposit s user a = some (s', shares))
+    (hr : redeem s' user shares = some (s'', assets_back)) :
+    (a : &Qopf;) - (assets_back : &Qopf;) &lt; &epsilon; * (a : &Qopf;) := <span class="kw">by</span> sorry</pre>
+
+  <p>
+    <code>deposit</code> returns the new state alongside the shares it
+    minted; <code>redeem</code> returns the new state alongside the
+    assets it paid out.
+    The round trip is just "feed the shares from deposit into
+    redeem," and the loss is the difference between what went in
+    (<code>a</code>) and what came back (<code>assets_back</code>).
+  </p>
+
+  <p>
+    Hand this to the AI and ask for a proof. It will fail. The
+    interesting part is <em>how</em> it fails.
+  </p>
+</section>
+
+<section>
+  <h2>The counter-example is the donation attack</h2>
+
+  <p>
+    Push it for the counter-example and you get back:
+  </p>
+
+<pre>a * (T + vT) &lt; B + vA</pre>
+
+  <p>
+    With <code>T</code> and <code>B</code> for the vault's share
+    supply and asset balance, and <code>vT</code>/<code>vA</code>
+    for Part 1's virtual offsets, this says the per-vault-token
+    price <code>(B + vA) / (T + vT)</code> is larger than
+    <code>a</code> itself &mdash; pricing one full vault token costs
+    more assets than the depositor is bringing in. The floor in
+    <code>vaultTokenFor</code> sends the depositor's share count to
+    zero; the subsequent redeem of zero shares returns zero assets;
+    the loss is 100% of the deposit.
+  </p>
+
+  <p>
+    This shape &mdash; deposit small relative to a high price, fresh
+    depositor wiped out &mdash; is the
+    <strong>donation-attack precondition</strong><sup class="fnref"><a href="#fn1" id="fnref1">1</a></sup>.
+    An attacker inflates <code>B</code> by transferring assets
+    directly into the vault (a path that doesn't mint shares; the
+    transfer just shows up as a "profit" event on the vault's books).
+    The per-share price spikes. The next depositor's deposit, if
+    it's small relative to that spiked price, gets rounded to zero
+    shares.
+  </p>
+
+  <p>
+    So the AI's refusal isn't a tooling limitation. The theorem we
+    tried to prove is genuinely false, and the witness for its
+    falsity is a known exploit pattern. The proof attempt did exactly
+    what we asked of it &mdash; and in doing so, handed us back the
+    threat model.
+  </p>
+</section>
+
+<section>
+  <h2>The two-line refinement &mdash; and what Lean does for you</h2>
+
+  <p>
+    The counter-example tells us the bound has to be conditional. We
+    can already guess the rough shape, in plain English:
+  </p>
+
+  <ul>
+    <li>the price shouldn't be too high relative to what a depositor pays;</li>
+    <li>the deposit shouldn't be too small.</li>
+  </ul>
+
+  <p>
+    Notice: <em>these are not bounds</em>. They are vague directions.
+    "Not too high" relative to what? Smaller than what number? The
+    actual side conditions, the ones that make the theorem provable,
+    are specific functional relationships between the price, the
+    deposit, the tolerance <code>&epsilon;</code>, and possibly other
+    quantities. We don't know them.
+  </p>
+
+  <p>
+    That's fine. We don't have to.
+  </p>
+
+  <p>
+    The Lean-based AI workflow is built around exactly this gap. You
+    hand the AI the two informal directions &mdash; "find me bounds
+    on the price and the deposit that make this provable" &mdash; and
+    let it propose specific side conditions and try to prove the
+    theorem under them. <em>If the proposed bounds are right, Lean
+    accepts the proof; if they're wrong, Lean rejects it, and the AI
+    iterates.</em> There is no path to "looks plausible but is
+    actually wrong": the kernel either accepts the script or it
+    doesn't.
+  </p>
+
+  <p class="callout">
+    This is the part that does the heavy lifting. Without Lean in
+    the loop, an AI that proposes a side condition is just guessing,
+    and you have to vet the guess by hand. With Lean in the loop, the
+    AI proposes <em>and</em> defends its guess; if it can't defend
+    it, you get a precise error to iterate against. Wrong bounds
+    fail loudly. Right bounds compile.
+  </p>
+
+  <p>
+    After a handful of iterations &mdash; the AI proposes a bound,
+    Lean complains, the AI tightens, eventually Lean accepts &mdash;
+    you end up with a statement like:
+  </p>
+
+<pre><span class="kw">theorem</span> <span class="name">deposit_then_redeem_loss</span>
+    {s s' s'' : State} {user : Addr} {a shares assets_back : &Nopf;} {P &epsilon; : &Qopf;}
+    (h&epsilon;_pos : 0 &lt; &epsilon;)
+    (h_price_cap : vaultTokenPrice s ≤ P)
+    (h_a_min : (P + 1) / &epsilon; ≤ (a : &Qopf;))
+    (hd : deposit s user a = some (s', shares))
+    (hr : redeem s' user shares = some (s'', assets_back)) :
+    (a : &Qopf;) - (assets_back : &Qopf;) &lt; &epsilon; * (a : &Qopf;) := ...</pre>
+
+  <p>
+    The two side conditions: <code>vaultTokenPrice s &le; P</code>
+    (the vault-token price is below some cap <code>P</code>) and
+    <code>(P + 1) / &epsilon; &le; a</code> (the deposit is at least
+    that much). The cap <code>P</code> is a parameter; the depositor
+    threshold is determined by the cap and the tolerance.
+  </p>
+
+  <p>
+    The proof body is about 80 lines of Lean &mdash; floor-bound
+    manipulations, the algebraic identity that makes the two floors'
+    contributions cancel cleanly, a handful of <code>nlinarith</code>
+    calls. I asked, I checked the statement, I ran <code>lake build</code>,
+    it passed. I did not read the proof body.
+  </p>
+</section>
+
+<section>
+  <h2>Reading the bound against deployment reality</h2>
+
+  <p>
+    The interesting work starts now. We have a machine-checked
+    statement: under <code>vaultTokenPrice s &le; P</code> and
+    <code>(P + 1) / &epsilon; &le; a</code>, the round-trip loses
+    strictly less than <code>&epsilon; &middot; a</code>. The next
+    question is whether these two conditions hold for the depositors
+    we care about.
+  </p>
+
+  <h3>The deposit threshold</h3>
+
+  <p>
+    <code>(P + 1) / &epsilon; &le; a</code> says the deposit has to
+    be at least roughly <code>P / &epsilon;</code> asset units, plus
+    a small additive term. For 18-decimal assets &mdash; the bulk
+    of ERC-20s &mdash; a single human-scale token is
+    <code>10<sup>18</sup></code> raw units. Even at
+    <code>&epsilon; = 10<sup>-6</sup></code> (one part per million)
+    and a price of <code>10<sup>3</sup></code>, the threshold is
+    around <code>10<sup>9</sup></code> raw units &mdash; many orders
+    of magnitude below any human-scale deposit. A frontend can
+    additionally enforce a minimum-deposit check before forwarding
+    the transaction. For 18-decimal deployments expecting
+    human-scale users, this condition can be easily
+    satisfied.
+  </p>
+
+  <p>
+    For lower-decimal assets &mdash; USDC, USDT, and a few others
+    use 6 &mdash; the picture is different. The threshold's
+    raw-unit count is the same, but the asset's per-token raw-unit
+    count is now <code>10<sup>6</sup></code> rather than
+    <code>10<sup>18</sup></code>, so the threshold occupies a
+    larger fraction of a token, and how comfortably it holds
+    depends on the expected price range. At a near-inception price
+    (<code>P &asymp; 1</code>) and a basis-point tolerance
+    (<code>&epsilon; = 10<sup>-4</sup></code>), the threshold is
+    around <code>10<sup>5</sup></code> raw units &mdash; well under
+    a dollar in USDC. As <code>P</code> climbs, or
+    <code>&epsilon;</code> tightens, the bound becomes meaningfully
+    tight, and whether it actually holds is worth checking against
+    a specific deployment's operating range rather than asserted in
+    general.
+  </p>
+
+  <h3>The price cap</h3>
+
+  <p>
+    The price cap is the harder one.
+  </p>
+
+  <p>
+    Under normal vault operation &mdash; yield accruing slowly,
+    principal moving in via deposits and out via redeems &mdash; the
+    price grows slowly and predictably. Whatever <code>P</code> the
+    deployment commits to (call it the price at deployment plus a
+    generous growth budget), the running price stays well below it.
+  </p>
+
+  <p>
+    The problem is that the price can also be moved by paths the
+    vault doesn't fully control. In our simple model, the main such
+    path is donation &mdash; assets transferred to the vault without
+    going through deposit, landing on its books as profit. Real
+    production vaults expose more: oracle inputs that can be skewed,
+    strategy adapters that interact with external markets, or more
+    generally any valuation of the underlying positions which
+    can spike momentarily. Any of these can move the per-share price
+    along channels the vault's user-facing entry points never see
+    directly.
+  </p>
+
+  <p>
+    For any nontrivial vault, then, the price cap is a protocol
+    invariant to defend rather than an assumption to take for
+    granted. <em>Whether the cap can be violated is the security
+    question.</em>
+  </p>
+</section>
+
+<section>
+  <h2>Mitigations enforce the cap as a protocol invariant</h2>
+
+  <p>
+    If you're designing a vault and the inflation surface is a real
+    concern, the takeaway from the proved theorem is: <em>your
+    mitigation's job is to make <code>vaultTokenPrice s &le; P</code>
+    a protocol invariant.</em> Different vault designs take different
+    routes; one concrete approach worth examining is the per-period
+    price-growth cap.
+  </p>
+
+  <p>
+    Morpho Vault V2 takes this route: the vault tracks an internal
+    "fair price" that grows at most some configured amount per unit
+    time, and the vault's externally exposed conversion rate is
+    clipped to the fair price. A donation that spikes the underlying
+    asset-to-share ratio doesn't propagate to depositors &mdash; they
+    convert at the slower fair price &mdash; until the fair price's
+    growth budget catches up. The donated value still accretes to
+    existing shareholders over time, and the price depositors see
+    remains protocol-enforced moment-to-moment &mdash; our theorem's
+    <code>P</code> cap is a direct protocol invariant.
+  </p>
+
+  <p>
+    The reason this design exists, and the reason it has the shape
+    it does, is exactly the bound our theorem proved. The mitigation
+    is a constructive answer to "how do you enforce the side
+    condition?"
+  </p>
+</section>
+
+<section>
+  <h2>What the workflow gives you</h2>
+
+  <p>What we did in this post, the steps spelled out:</p>
+
+  <ol>
+    <li>Asked the obvious thing. Lean refused.</li>
+    <li>Looked at the refusal. The counter-example was the donation-attack precondition.</li>
+    <li>Refined the spec with two informal constraints &mdash; "price bounded", "deposit large enough" &mdash; and let the AI propose the explicit bounds. Lean verified them.</li>
+    <li>Read the bounds against deployment reality. One condition is free in practice; the other is the live attack surface.</li>
+    <li>Looked at production-vault designs and saw the mitigation as a direct enforcer of the side condition.</li>
+  </ol>
+
+  <p>
+    The point worth highlighting: steps 2 through 5 are security
+    analysis, not proof engineering. The proof process &mdash; the
+    refusal, the side conditions, the bounds &mdash; does the
+    analytical work. Lean's role isn't to bless something we already
+    know; it's to <em>force the questions worth asking.</em>
+  </p>
+
+  <p>
+    The AI's role isn't to be trustworthy; it's to be a fast proposer
+    of side conditions and proofs. Trust comes from the kernel. The
+    only thing that needs human judgement is reading the proved
+    statement back against the deployment context &mdash; "is this
+    bound realistic? what can violate it?" &mdash; and that is
+    exactly the kind of judgement formal methods are meant to amplify.
+  </p>
+
+  <p>
+    The Lean sources for this post &mdash;
+    <code>LossBound.lean</code>, along with the Part 1 files it
+    builds on &mdash; live in the
+    <a href="https://github.com/daejunpark/lean-defi-guide/tree/main/simple-tokens-and-vaults"><code>simple-tokens-and-vaults/</code> directory</a>.
+  </p>
+</section>
+
+<section class="notes">
+  <h2>Notes</h2>
+  <ol class="footnotes">
+    <li id="fn1">
+      Part 1's virtual offsets do not contradict the precondition's
+      existence. Offsets bound the attacker's <em>payoff</em> &mdash;
+      a fraction <code>vT / (T + vT)</code> of any donation is captured
+      by a phantom holder that cannot withdraw, so the attacker cannot
+      recoup their own donation &mdash; but the depositor-loss state
+      above is set up by the algebraic condition, not by the offsets'
+      sizing. Virtual offsets bound the attacker's incentive to
+      engineer the state; eliminating the underlying state is a
+      separate guarantee.
+      <a href="#fnref1" class="fnback" aria-label="back to text">&#8617;</a>
+    </li>
+  </ol>
+</section>
+
+</div>
+</article>
+
+<footer class="site">
+  <div class="wrap">
+    <span>Lean sources: <a href="https://github.com/daejunpark/lean-defi-guide">github.com/daejunpark/lean-defi-guide</a></span>
+    <span>Part 2 of an explainer series on formally verifying DeFi in Lean</span>
+  </div>
+</footer>
+
+</body>
+</html>
